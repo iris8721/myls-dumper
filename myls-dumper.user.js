@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MyLS Content Dumper
 // @namespace    myls-dumper
-// @version      1.0
+// @version      1.1
 // @description  Recursively walks a Brightspace/D2L Content module tree and downloads every file-backed topic into one zip
 // @match        *://*/d2l/le/content/*/Home*
 // @require      https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js
@@ -12,10 +12,64 @@
   'use strict';
 
   const orgMatch = location.pathname.match(/\/d2l\/le\/content\/(\d+)\//);
+  if (!orgMatch) return;
   const ORG = orgMatch[1];
 
-  function sanitize(name) {
-    return name.replace(/[\\/:*?"<>|]/g, '_').trim();
+  function sanitize(name, fallback) {
+    const cleaned = name
+      .replace(/[\\/:*?"<>|\u0000-\u001f\u007f]/g, '_')
+      .replace(/\s+/g, ' ')
+      .replace(/^[\s.]+|[\s.]+$/g, '');
+    return cleaned || fallback;
+  }
+
+  function filenameFromDisposition(disposition) {
+    const ext = disposition.match(/filename\*\s*=\s*([^']*)'[^']*'([^;]+)/i);
+    if (ext) {
+      const value = ext[2].trim();
+      try {
+        return decodeURIComponent(value);
+      } catch (err) {
+        return value;
+      }
+    }
+    const plain = disposition.match(/filename\s*=\s*(?:"([^"]*)"|([^;]+))/i);
+    if (!plain) return null;
+    return (plain[1] !== undefined ? plain[1] : plain[2]).trim();
+  }
+
+  function zipEntryName(rawName, title, topicId) {
+    const base = rawName ? rawName.split(/[\\/]/).pop() : '';
+    return sanitize(base, '') || sanitize(title, topicId);
+  }
+
+  function uniquePath(dir, filename, topicId, used) {
+    let candidate = `${dir}/${filename}`;
+    if (used.has(candidate)) {
+      const dot = filename.lastIndexOf('.');
+      const stem = dot > 0 ? filename.slice(0, dot) : filename;
+      const ext = dot > 0 ? filename.slice(dot) : '';
+      candidate = `${dir}/${stem}-${topicId}${ext}`;
+      let n = 2;
+      while (used.has(candidate)) {
+        candidate = `${dir}/${stem}-${topicId}-${n}${ext}`;
+        n++;
+      }
+      log(`[myls-dumper] topic ${topicId}: ${dir}/${filename} already in zip, renamed to ${candidate}`);
+    }
+    used.add(candidate);
+    return candidate;
+  }
+
+  function triggerDownload(blob, name) {
+    const a = document.createElement('a');
+    const url = URL.createObjectURL(blob);
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
   }
 
   function sleep(ms) {
@@ -30,14 +84,7 @@
   }
 
   function saveLog() {
-    const blob = new Blob([logLines.join('\n')], { type: 'text/plain' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `myls-dumper-log-${Date.now()}.txt`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(a.href);
+    triggerDownload(new Blob([logLines.join('\n')], { type: 'text/plain' }), `myls-dumper-log-${Date.now()}.txt`);
   }
 
   function collectModules(ul, pathParts, out) {
@@ -50,7 +97,7 @@
       const moduleId = idMatch[1];
       const titleEl = li.querySelector(`#TreeItem${moduleId} > .d2l-textblock:not(.d2l-offscreen)`);
       const title = titleEl ? titleEl.textContent.trim() : moduleId;
-      const path = [...pathParts, sanitize(title)];
+      const path = [...pathParts, sanitize(title, moduleId)];
 
       out.push({ moduleId, path });
 
@@ -75,17 +122,32 @@
     return null;
   }
 
-  async function fetchTopics(moduleId) {
-    const res = await fetch(`/d2l/le/content/${ORG}/ModuleDetailsPartial?mId=${moduleId}&writeHistoryEntry=0`, {
-      credentials: 'same-origin',
-      headers: { 'X-Requested-With': 'XMLHttpRequest' },
-    });
+  async function fetchTopics(moduleId, stats) {
+    let res;
+    try {
+      res = await fetch(`/d2l/le/content/${ORG}/ModuleDetailsPartial?mId=${moduleId}&writeHistoryEntry=0`, {
+        credentials: 'same-origin',
+        headers: { 'X-Requested-With': 'XMLHttpRequest' },
+      });
+    } catch (err) {
+      log(`[myls-dumper] module ${moduleId}: ModuleDetailsPartial request failed (${err}), skipping`);
+      stats.failedModules++;
+      return [];
+    }
     if (!res.ok) {
       log(`[myls-dumper] module ${moduleId}: ModuleDetailsPartial returned ${res.status}, skipping`);
+      stats.failedModules++;
       return [];
     }
 
-    const raw = await res.text();
+    let raw;
+    try {
+      raw = await res.text();
+    } catch (err) {
+      log(`[myls-dumper] module ${moduleId}: failed to read ModuleDetailsPartial body (${err}), skipping`);
+      stats.failedModules++;
+      return [];
+    }
     let html = raw;
     if (raw.startsWith('while(1);')) {
       try {
@@ -93,6 +155,7 @@
         html = findHtmlPayload(parsed) || '';
       } catch (err) {
         log(`[myls-dumper] module ${moduleId}: failed to parse JSON envelope (${err})`);
+        stats.failedModules++;
         return [];
       }
     }
@@ -101,34 +164,49 @@
 
     const topics = [];
     doc.querySelectorAll('a.d2l-link[href*="/viewContent/"]').forEach((a) => {
-      const m = a.getAttribute('href').match(/viewContent\/(\d+)\/View/);
-      if (m) topics.push({ topicId: m[1], title: a.textContent.trim() });
+      const href = a.getAttribute('href');
+      const m = href.match(/viewContent\/(\d+)\/View/);
+      if (m) {
+        topics.push({ topicId: m[1], title: a.textContent.trim() });
+      } else {
+        log(`[myls-dumper] module ${moduleId}: unrecognised topic link ${href}, skipping`);
+      }
     });
 
     const loadMore = doc.querySelector('.d2l-loadmore-pager:not(.d2l-hidden)');
     if (loadMore) {
       log(`[myls-dumper] module ${moduleId} has a "Load More" pager; some topics may be missing`);
+      stats.pagedModules++;
     }
 
     return topics;
   }
 
-  async function downloadTopic(topicId, path, title, stats, zip) {
+  async function downloadTopic(topicId, path, title, stats, zip, usedPaths) {
     let info;
     try {
       const infoRes = await fetch(
         `/d2l/le/content/${ORG}/topics/files/download/${topicId}/CheckFileTopicInfo`,
         { credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest' } }
       );
-      if (!infoRes.ok) throw new Error(`status ${infoRes.status}`);
+      if (!infoRes.ok) {
+        stats.notFileBacked++;
+        return;
+      }
       const text = await infoRes.text();
       const jsonText = text.startsWith('while(1);') ? text.slice('while(1);'.length) : text;
       info = JSON.parse(jsonText);
     } catch (err) {
-      stats.notFileBacked++;
+      stats.failed++;
+      log(`[myls-dumper] topic ${topicId}: CheckFileTopicInfo failed (${err})`);
       return;
     }
 
+    if (!info || typeof info !== 'object') {
+      stats.failed++;
+      log(`[myls-dumper] topic ${topicId}: unexpected CheckFileTopicInfo payload`);
+      return;
+    }
     if (info.IsBroken) {
       stats.broken++;
       return;
@@ -138,17 +216,24 @@
       return;
     }
 
-    const fileRes = await fetch(
-      `/d2l/le/content/${ORG}/topics/files/download/${topicId}/DirectFileTopicDownload`,
-      { credentials: 'same-origin' }
-    );
-    const blob = await fileRes.blob();
+    let blob;
+    let disposition;
+    try {
+      const fileRes = await fetch(
+        `/d2l/le/content/${ORG}/topics/files/download/${topicId}/DirectFileTopicDownload`,
+        { credentials: 'same-origin' }
+      );
+      if (!fileRes.ok) throw new Error(`status ${fileRes.status}`);
+      disposition = fileRes.headers.get('Content-Disposition') || '';
+      blob = await fileRes.blob();
+    } catch (err) {
+      stats.failed++;
+      log(`[myls-dumper] topic ${topicId}: DirectFileTopicDownload failed (${err})`);
+      return;
+    }
 
-    const disposition = fileRes.headers.get('Content-Disposition') || '';
-    const match = disposition.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/);
-    const filename = match ? decodeURIComponent(match[1]) : sanitize(title);
-
-    const zipPath = `${path.join('/')}/${filename}`;
+    const filename = zipEntryName(filenameFromDisposition(disposition), title, topicId);
+    const zipPath = uniquePath(path.join('/'), filename, topicId, usedPaths);
     zip.file(zipPath, blob);
 
     stats.downloaded++;
@@ -157,13 +242,7 @@
 
   async function saveZip(zip) {
     const blob = await zip.generateAsync({ type: 'blob' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `myls-dump-${Date.now()}.zip`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(a.href);
+    triggerDownload(blob, `myls-dump-${Date.now()}.zip`);
   }
 
   let stopped = false;
@@ -177,8 +256,17 @@
     stopBtn.disabled = false;
     updateProgress(0, 0);
 
-    const stats = { downloaded: 0, notFileBacked: 0, broken: 0, packaged: 0 };
+    const stats = {
+      downloaded: 0,
+      failed: 0,
+      notFileBacked: 0,
+      broken: 0,
+      packaged: 0,
+      failedModules: 0,
+      pagedModules: 0,
+    };
     const zip = new JSZip();
+    const usedPaths = new Set();
 
     try {
       const tree = document.getElementById('D2L_LE_Content_TreeBrowser');
@@ -194,7 +282,7 @@
       for (const mod of modules) {
         if (stopped) break;
         log(`[myls-dumper] scanning: ${mod.path.join(' > ')}`);
-        mod.topics = await fetchTopics(mod.moduleId);
+        mod.topics = await fetchTopics(mod.moduleId, stats);
         await sleep(300);
       }
       if (stopped) return;
@@ -218,23 +306,32 @@
       for (let i = 0; i < toDownload.length; i++) {
         if (stopped) break;
         const topic = toDownload[i];
-        await downloadTopic(topic.topicId, topic.path, topic.title, stats, zip);
+        await downloadTopic(topic.topicId, topic.path, topic.title, stats, zip, usedPaths);
         updateProgress(i + 1, toDownload.length);
         await sleep(300);
       }
     } finally {
-      running = false;
-      dumpBtn.disabled = false;
       stopBtn.disabled = true;
       log(
-        `[myls-dumper] ${stopped ? 'stopped' : 'done'} — downloaded: ${stats.downloaded}, ` +
+        `[myls-dumper] ${stopped ? 'stopped' : 'done'} — downloaded: ${stats.downloaded}, failed: ${stats.failed}, ` +
           `not file-backed: ${stats.notFileBacked}, broken: ${stats.broken}, packaged (skipped): ${stats.packaged}`
       );
-      if (stats.downloaded > 0) {
-        log('[myls-dumper] building zip...');
-        await saveZip(zip);
+      if (stats.failedModules > 0) {
+        log(`[myls-dumper] ${stats.failedModules} modules could not be listed; re-run to pick them up`);
       }
-      saveLog();
+      if (stats.pagedModules > 0) {
+        log(`[myls-dumper] ${stats.pagedModules} modules had a "Load More" pager; their topic lists may be incomplete`);
+      }
+      try {
+        if (stats.downloaded > 0) {
+          log('[myls-dumper] building zip...');
+          await saveZip(zip);
+        }
+        saveLog();
+      } finally {
+        running = false;
+        dumpBtn.disabled = false;
+      }
     }
   }
 
